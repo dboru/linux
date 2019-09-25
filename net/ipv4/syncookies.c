@@ -12,6 +12,8 @@
 #include <linux/siphash.h>
 #include <linux/kernel.h>
 #include <linux/export.h>
+#include <net/mptcp.h>
+#include <net/mptcp_v4.h>
 #include <net/secure_seq.h>
 #include <net/tcp.h>
 #include <net/route.h>
@@ -206,8 +208,28 @@ struct sock *tcp_get_cookie_sock(struct sock *sk, struct sk_buff *skb,
 	struct sock *child;
 	bool own_req;
 
+	#ifdef CONFIG_MPTCP
+	int ret;
+	#endif
+
 	child = icsk->icsk_af_ops->syn_recv_sock(sk, skb, req, dst,
 						 NULL, &own_req);
+
+	#ifdef CONFIG_MPTCP
+	if (!child)
+		goto listen_overflow;
+
+	ret = mptcp_check_req_master(sk, child, req, skb, 0, tsoff);
+	if (ret < 0)
+		return NULL;
+
+	if (!ret)
+		return tcp_sk(child)->mpcb->master_sk;
+
+listen_overflow:
+#endif
+
+
 	if (child) {
 		refcount_set(&req->rsk_refcnt, 1);
 		tcp_sk(child)->tsoffset = tsoff;
@@ -295,6 +317,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 {
 	struct ip_options *opt = &TCP_SKB_CB(skb)->header.h4.opt;
 	struct tcp_options_received tcp_opt;
+	struct mptcp_options_received mopt;
 	struct inet_request_sock *ireq;
 	struct tcp_request_sock *treq;
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -324,7 +347,10 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 
 	/* check for timestamp cookie support */
 	memset(&tcp_opt, 0, sizeof(tcp_opt));
-	tcp_parse_options(sock_net(sk), skb, &tcp_opt, 0, NULL);
+	mptcp_init_mp_opt(&mopt);
+	tcp_parse_options(sock_net(sk), skb, &tcp_opt, &mopt, 0, NULL, NULL);
+
+	// tcp_parse_options(sock_net(sk), skb, &tcp_opt, 0, NULL);
 
 	if (tcp_opt.saw_tstamp && tcp_opt.rcv_tsecr) {
 		tsoff = secure_tcp_ts_off(sock_net(sk),
@@ -337,6 +363,12 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 		goto out;
 
 	ret = NULL;
+   #ifdef CONFIG_MPTCP
+	if (mopt.saw_mpc)
+		req = inet_reqsk_alloc(&mptcp_request_sock_ops, sk, false); /* for safety */
+	else
+   #endif
+
 	req = inet_reqsk_alloc(&tcp_request_sock_ops, sk, false); /* for safety */
 	if (!req)
 		goto out;
@@ -357,6 +389,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 	ireq->sack_ok		= tcp_opt.sack_ok;
 	ireq->wscale_ok		= tcp_opt.wscale_ok;
 	ireq->tstamp_ok		= tcp_opt.saw_tstamp;
+	ireq->mptcp_rqsk	= 0;
 	req->ts_recent		= tcp_opt.saw_tstamp ? tcp_opt.rcv_tsval : 0;
 	treq->snt_synack	= 0;
 	treq->tfo_listener	= false;
@@ -364,6 +397,9 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
 		ireq->smc_ok = 0;
 
 	ireq->ir_iif = inet_request_bound_dev_if(sk, skb);
+
+	if (mopt.saw_mpc)
+		mptcp_cookies_reqsk_init(req, &mopt, skb);
 
 	/* We throwed the options of the initial SYN away, so we hope
 	 * the ACK carries the same options again (see RFC1122 4.2.3.8)

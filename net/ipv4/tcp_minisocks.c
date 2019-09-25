@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/sysctl.h>
 #include <linux/workqueue.h>
+#include <net/mptcp.h>
 #include <linux/static_key.h>
 #include <net/tcp.h>
 #include <net/inet_common.h>
@@ -95,10 +96,13 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 	struct tcp_options_received tmp_opt;
 	struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);
 	bool paws_reject = false;
+	struct mptcp_options_received mopt;
 
 	tmp_opt.saw_tstamp = 0;
-	if (th->doff > (sizeof(*th) >> 2) && tcptw->tw_ts_recent_stamp) {
-		tcp_parse_options(twsk_net(tw), skb, &tmp_opt, 0, NULL);
+	if (th->doff > (sizeof(*th) >> 2) && (tcptw->tw_ts_recent_stamp || tcptw->mptcp_tw)) {
+		mptcp_init_mp_opt(&mopt);
+		// tcp_parse_options(twsk_net(tw), skb, &tmp_opt, 0, NULL);
+		tcp_parse_options(twsk_net(tw), skb, &tmp_opt, &mopt, 0, NULL, NULL);
 
 		if (tmp_opt.saw_tstamp) {
 			if (tmp_opt.rcv_tsecr)
@@ -107,6 +111,13 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 			tmp_opt.ts_recent_stamp	= tcptw->tw_ts_recent_stamp;
 			paws_reject = tcp_paws_reject(&tmp_opt, th->rst);
 		}
+
+		if (unlikely(mopt.mp_fclose) && tcptw->mptcp_tw) {
+			if (mopt.mptcp_sender_key == tcptw->mptcp_tw->loc_key)
+				return TCP_TW_RST;
+		}
+
+
 	}
 
 	if (tw->tw_substate == TCP_FIN_WAIT2) {
@@ -130,6 +141,17 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 		if (!th->ack ||
 		    !after(TCP_SKB_CB(skb)->end_seq, tcptw->tw_rcv_nxt) ||
 		    TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq) {
+
+			/* If mptcp_is_data_fin() returns true, we are sure that
+			 * mopt has been initialized - otherwise it would not
+			 * be a DATA_FIN.
+			 */
+			if (tcptw->mptcp_tw && tcptw->mptcp_tw->meta_tw &&
+			    mptcp_is_data_fin(skb) &&
+			    TCP_SKB_CB(skb)->seq == tcptw->tw_rcv_nxt &&
+			    mopt.data_seq + 1 == (u32)tcptw->mptcp_tw->rcv_nxt)
+				return TCP_TW_ACK;
+
 			inet_twsk_put(tw);
 			return TCP_TW_SUCCESS;
 		}
@@ -275,6 +297,16 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 		tcptw->tw_ts_offset	= tp->tsoffset;
 		tcptw->tw_last_oow_ack_time = 0;
 		tcptw->tw_tx_delay	= tp->tcp_tx_delay;
+
+		if (mptcp(tp)) {
+			if (mptcp_init_tw_sock(sk, tcptw)) {
+				inet_twsk_free(tw);
+				goto exit;
+			}
+		} else {
+			tcptw->mptcp_tw = NULL;
+		}
+
 #if IS_ENABLED(CONFIG_IPV6)
 		if (tw->tw_family == PF_INET6) {
 			struct ipv6_pinfo *np = inet6_sk(sk);
@@ -345,6 +377,9 @@ void tcp_twsk_destructor(struct sock *sk)
 #ifdef CONFIG_TCP_MD5SIG
 	if (static_branch_unlikely(&tcp_md5_needed)) {
 		struct tcp_timewait_sock *twsk = tcp_twsk(sk);
+
+		if (twsk->mptcp_tw)
+		   mptcp_twsk_destructor(twsk);
 
 		if (twsk->tw_md5_key)
 			kfree_rcu(twsk->tw_md5_key, rcu);
@@ -576,6 +611,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 			   bool fastopen, bool *req_stolen)
 {
 	struct tcp_options_received tmp_opt;
+	struct mptcp_options_received mopt;
 	struct sock *child;
 	const struct tcphdr *th = tcp_hdr(skb);
 	__be32 flg = tcp_flag_word(th) & (TCP_FLAG_RST|TCP_FLAG_SYN|TCP_FLAG_ACK);
@@ -583,8 +619,12 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	bool own_req;
 
 	tmp_opt.saw_tstamp = 0;
+
+	mptcp_init_mp_opt(&mopt);
+
 	if (th->doff > (sizeof(struct tcphdr)>>2)) {
-		tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0, NULL);
+		tcp_parse_options(sock_net(sk), skb, &tmp_opt, &mopt, 0, NULL, NULL);
+		// tcp_parse_options(sock_net(sk), skb, &tmp_opt, 0, NULL);
 
 		if (tmp_opt.saw_tstamp) {
 			tmp_opt.ts_recent = req->ts_recent;
@@ -778,6 +818,21 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	if (!child)
 		goto listen_overflow;
 
+
+	if (own_req && !is_meta_sk(sk)) {
+		int ret = mptcp_check_req_master(sk, child, req, skb, 1, 0);
+		if (ret < 0)
+			goto listen_overflow;
+
+		/* MPTCP-supported */
+		if (!ret)
+			return tcp_sk(child)->mpcb->master_sk;
+	} else if (own_req) {
+		return mptcp_check_req_child(sk, child, req, skb, &mopt);
+	}
+
+
+
 	sock_rps_save_rxhash(child, skb);
 	tcp_synack_rtt_meas(child, req);
 	*req_stolen = !own_req;
@@ -827,10 +882,19 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 	int ret = 0;
 	int state = child->sk_state;
 
+	struct sock *meta_sk = mptcp(tcp_sk(child)) ? mptcp_meta_sk(child) : child;
+
 	/* record NAPI ID of child */
 	sk_mark_napi_id(child, skb);
 
 	tcp_segs_in(tcp_sk(child), skb);
+
+	/* The following will be removed when we allow lockless data-reception
+	 * on the subflows.
+	 */
+	if (mptcp(tcp_sk(child)))
+		bh_lock_sock_nested(meta_sk);
+
 	if (!sock_owned_by_user(child)) {
 		ret = tcp_rcv_state_process(child, skb);
 		/* Wakeup parent, send SIGIO */
@@ -841,10 +905,14 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 		 * in main socket hash table and lock on listening
 		 * socket does not protect us more.
 		 */
+		if (mptcp(tcp_sk(child)))
+			mptcp_prepare_for_backlog(child, skb);
 		__sk_add_backlog(child, skb);
 	}
 
 	bh_unlock_sock(child);
+	if (mptcp(tcp_sk(child)))
+		bh_unlock_sock(meta_sk);
 	sock_put(child);
 	return ret;
 }

@@ -36,6 +36,8 @@
  */
 
 #define pr_fmt(fmt) "TCP: " fmt
+#include <net/mptcp.h>
+#include <net/mptcp_v4.h>
 
 #include <net/tcp.h>
 
@@ -256,7 +258,13 @@ static u16 tcp_select_window(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 old_win = tp->rcv_wnd;
-	u32 cur_win = tcp_receive_window(tp);
+	/* The window must never shrink at the meta-level. At the subflow we
+	 * have to allow this. Otherwise we may announce a window too large
+	 * for the current meta-level sk_rcvbuf.
+	 */
+	u32 cur_win = tcp_receive_window(mptcp(tp) ? tcp_sk(mptcp_meta_sk(sk)) : tp);
+
+	// u32 cur_win = tcp_receive_window(tp);
 	u32 new_win = __tcp_select_window(sk);
 
 	/* Never shrink the offered window */
@@ -583,6 +591,10 @@ static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 	}
 
 	smc_options_write(ptr, &options);
+
+	if (unlikely(OPTION_MPTCP & opts->options))
+		mptcp_options_write(ptr, tp, opts, skb);
+
 }
 
 static void smc_set_option(const struct tcp_sock *tp,
@@ -670,6 +682,9 @@ static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 			remaining -= TCPOLEN_SACKPERM_ALIGNED;
 	}
 
+   if (tp->request_mptcp || mptcp(tp))
+		mptcp_syn_options(sk, opts, &remaining);
+
 	if (fastopen && fastopen->cookie.len >= 0) {
 		u32 need = fastopen->cookie.len;
 
@@ -749,6 +764,9 @@ static unsigned int tcp_synack_options(const struct sock *sk,
 	}
 
 	smc_set_option_cond(tcp_sk(sk), ireq, opts, &remaining);
+
+	if (ireq->saw_mpc)
+		mptcp_synack_options(req, opts, &remaining);
 
 	return MAX_TCP_OPTION_SPACE - remaining;
 }
@@ -840,12 +858,31 @@ static void tcp_tsq_write(struct sock *sk)
 
 static void tcp_tsq_handler(struct sock *sk)
 {
-	bh_lock_sock(sk);
-	if (!sock_owned_by_user(sk))
+	struct sock *meta_sk = mptcp(tp) ? mptcp_meta_sk(sk) : sk;
+    bh_lock_sock(meta_sk);
+
+    if (!sock_owned_by_user(meta_sk)) {
 		tcp_tsq_write(sk);
-	else if (!test_and_set_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags))
-		sock_hold(sk);
-	bh_unlock_sock(sk);
+
+		if (mptcp(tp))
+			tcp_tsq_write(meta_sk);
+	} else {
+		if (!test_and_set_bit(TCP_TSQ_DEFERRED, &meta_sk->sk_tsq_flags))
+			sock_hold(meta_sk);
+
+		if ((mptcp(tp)) && (sk->sk_state != TCP_CLOSE))
+			mptcp_tsq_flags(sk);
+	}
+
+	bh_unlock_sock(meta_sk);
+
+
+	// bh_lock_sock(sk);
+	// if (!sock_owned_by_user(sk))
+	// 	tcp_tsq_write(sk);
+	// else if (!test_and_set_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags))
+	// 	sock_hold(sk);
+	// bh_unlock_sock(sk);
 }
 /*
  * One tasklet per cpu tries to send more skbs.
@@ -905,6 +942,8 @@ void tcp_release_cb(struct sock *sk)
 	if (flags & TCPF_TSQ_DEFERRED) {
 		tcp_tsq_write(sk);
 		__sock_put(sk);
+		if (mptcp(tcp_sk(sk)))
+			tcp_tsq_write(mptcp_meta_sk(sk));
 	}
 	/* Here begins the tricky part :
 	 * We are called from release_sock() with :
@@ -929,6 +968,15 @@ void tcp_release_cb(struct sock *sk)
 		inet_csk(sk)->icsk_af_ops->mtu_reduced(sk);
 		__sock_put(sk);
 	}
+
+	if (flags & TCPF_PATH_MANAGER_DEFERRED) {
+		if (tcp_sk(sk)->mpcb->pm_ops->release_sock)
+			tcp_sk(sk)->mpcb->pm_ops->release_sock(sk);
+		__sock_put(sk);
+	}
+	if (flags & TCPF_SUB_DEFERRED)
+		mptcp_tsq_sub_deferred(sk);
+
 }
 EXPORT_SYMBOL(tcp_release_cb);
 
@@ -1875,8 +1923,13 @@ static inline bool tcp_nagle_test(const struct tcp_sock *tp, const struct sk_buf
 		return true;
 
 	/* Don't use the nagle rule for urgent data (or for the final FIN). */
-	if (tcp_urg_mode(tp) || (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN))
+	if (tcp_urg_mode(tp) || (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) ||
+	    mptcp_is_data_fin(skb))
 		return true;
+
+	// /* Don't use the nagle rule for urgent data (or for the final FIN). */
+	// if (tcp_urg_mode(tp) || (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN))
+	// 	return true;
 
 	if (!tcp_nagle_check(skb->len < cur_mss, tp, nonagle))
 		return true;
@@ -2051,9 +2104,13 @@ static bool tcp_tso_should_defer(struct sock *sk, struct sk_buff *skb,
 		}
 	}
 
+	// /* If this packet won't get more data, do not wait. */
+	// if ((TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) ||
+	//     TCP_SKB_CB(skb)->eor)
+	// 	goto send_now;
+
 	/* If this packet won't get more data, do not wait. */
-	if ((TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) ||
-	    TCP_SKB_CB(skb)->eor)
+	if ((TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) || TCP_SKB_CB(skb)->eor || mptcp_is_data_fin(skb))
 		goto send_now;
 
 	return true;
@@ -2401,7 +2458,12 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 	sent_pkts = 0;
 
 	tcp_mstamp_refresh(tp);
-	if (!push_one) {
+
+	/* pmtu not yet supported with MPTCP. Should be possible, by early
+	 * exiting the loop inside tcp_mtu_probe, making sure that only one
+	 * single DSS-mapping gets probed.
+	 */
+	if (!push_one && !mptcp(tp)) {
 		/* Do MTU probing. */
 		result = tcp_mtu_probe(sk);
 		if (!result) {
@@ -2410,6 +2472,17 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			sent_pkts = 1;
 		}
 	}
+
+
+	// if (!push_one) {
+	// 	/* Do MTU probing. */
+	// 	result = tcp_mtu_probe(sk);
+	// 	if (!result) {
+	// 		return false;
+	// 	} else if (result > 0) {
+	// 		sent_pkts = 1;
+	// 	}
+	// }
 
 	max_segs = tcp_tso_segs(sk, mss_now);
 	while ((skb = tcp_send_head(sk))) {
@@ -2880,6 +2953,10 @@ static void tcp_retrans_try_collapse(struct sock *sk, struct sk_buff *to,
 	if (!sock_net(sk)->ipv4.sysctl_tcp_retrans_collapse)
 		return;
 	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)
+		return;
+
+	/* Currently not supported for MPTCP - but it should be possible */
+	if (mptcp(tp))
 		return;
 
 	skb_rbtree_walk_from_safe(skb, tmp) {
@@ -3474,6 +3551,39 @@ static void tcp_connect_init(struct sock *sk)
 	inet_csk(sk)->icsk_rto = tcp_timeout_init(sk);
 	inet_csk(sk)->icsk_retransmits = 0;
 	tcp_clear_retrans(tp);
+
+#ifdef CONFIG_MPTCP
+	if (sock_flag(sk, SOCK_MPTCP) && mptcp_doit(sk)) {
+		if (is_master_tp(tp)) {
+			tp->request_mptcp = 1;
+			mptcp_connect_init(sk);
+		} else if (tp->mptcp) {
+			struct inet_sock *inet	= inet_sk(sk);
+
+			tp->mptcp->snt_isn	= tp->write_seq;
+			tp->mptcp->init_rcv_wnd	= tp->rcv_wnd;
+
+			/* Set nonce for new subflows */
+			if (sk->sk_family == AF_INET)
+				tp->mptcp->mptcp_loc_nonce = mptcp_v4_get_nonce(
+							inet->inet_saddr,
+							inet->inet_daddr,
+							inet->inet_sport,
+							inet->inet_dport);
+// #if IS_ENABLED(CONFIG_IPV6)
+// 			else
+// 				tp->mptcp->mptcp_loc_nonce = mptcp_v6_get_nonce(
+// 						inet6_sk(sk)->saddr.s6_addr32,
+// 						sk->sk_v6_daddr.s6_addr32,
+// 						inet->inet_sport,
+// 						inet->inet_dport);
+// #endif
+
+		}
+	}
+#endif
+
+
 }
 
 static void tcp_connect_queue_skb(struct sock *sk, struct sk_buff *skb)

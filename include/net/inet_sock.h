@@ -88,6 +88,7 @@ struct inet_request_sock {
 				accecn_ok  : 1,
 				acked	   : 1,
 				no_srccheck: 1,
+				mptcp_rqsk : 1,
 				smc_ok	   : 1;
 	u32                     ir_mark;
 	union {
